@@ -5,6 +5,7 @@ import (
 
 	"github.com/todennus/file-service/adapter/abstraction"
 	"github.com/todennus/file-service/usecase"
+	"github.com/todennus/shared/config"
 )
 
 type Usecases struct {
@@ -13,6 +14,7 @@ type Usecases struct {
 
 func InitializeUsecases(
 	ctx context.Context,
+	config *config.Config,
 	infras *Infras,
 	domains *Domains,
 	repositories *Repositories,
@@ -20,10 +22,13 @@ func InitializeUsecases(
 	uc := &Usecases{}
 
 	uc.FileUsecase = usecase.NewFileUsecase(
+		config.Variable.File.MaxInMemory,
+		config.TokenEngine,
 		domains.FileDomain,
-		repositories.FileSessionRepository,
+		repositories.FileUploadPolicyRepository,
+		repositories.FileInfoRepository,
+		repositories.FileOwnershipRepository,
 		repositories.FileStorageRepository,
-		repositories.UserRepository,
 	)
 
 	return uc, nil

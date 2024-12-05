@@ -1,6 +1,8 @@
 package dto
 
-import "io"
+import (
+	"io"
+)
 
 type CommandImageMetadataResult struct {
 	Type       string `json:"type"`

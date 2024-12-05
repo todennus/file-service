@@ -3,37 +3,30 @@ package abstraction
 import (
 	"context"
 	"io"
+	"time"
 
 	"github.com/todennus/file-service/domain"
-	"github.com/todennus/file-service/usecase/dto"
+	"github.com/xybor-x/snowflake"
 )
 
-type UserRepository interface {
-	ValidateAvatarPolicyToken(ctx context.Context, policyToken string) (*dto.OverridenPolicyInfo, error)
+type FileUploadPolicyRepository interface {
+	Save(ctx context.Context, policy *domain.UploadPolicy) error
+	LoadAndDelete(ctx context.Context, token string) (*domain.UploadPolicy, error)
 }
 
-type FileSessionRepository interface {
-	SaveUploadSession(ctx context.Context, session *domain.UploadSession) error
-	LoadUploadSession(ctx context.Context, uploadToken string) (*domain.UploadSession, error)
-	DeleteUploadSession(ctx context.Context, uploadToken string) error
+type FileInfoRepository interface {
+	Create(ctx context.Context, file *domain.FileInfo) error
+	GetByID(ctx context.Context, id string) (*domain.FileInfo, error)
+}
 
-	SaveTemporarySession(ctx context.Context, session *domain.TemporaryFileSession) error
-	LoadTemporarySession(ctx context.Context, sessionToken string) (*domain.TemporaryFileSession, error)
-	DeleteTemporarySession(ctx context.Context, sessionToken string) error
+type FileOwnershipRepository interface {
+	Create(ctx context.Context, fileowner *domain.FileOwnership) error
+	Get(ctx context.Context, fileID string, userID snowflake.ID) (*domain.FileOwnership, error)
+	GetByID(ctx context.Context, id snowflake.ID) (*domain.FileOwnership, error)
+	ChangeRefCount(ctx context.Context, id snowflake.ID, change int) error
 }
 
 type FileStorageRepository interface {
-	ImageURL(name string) string
-	ImageExists(ctx context.Context, name string) (bool, error)
-	ImageSave(ctx context.Context, name string, temporaryFileName string) error
-
-	StoreTemporary(
-		ctx context.Context,
-		temporaryFileName string,
-		content io.Reader,
-		size int64,
-		contentType string,
-	) (*dto.StorageUploadFileMetadata, error)
-	GetTemporary(ctx context.Context, temporaryFileName string) (io.ReadCloser, *dto.StorageDownloadFileMetadata, error)
-	RemoveTemporary(ctx context.Context, temporaryFileName string) error
+	Presign(ctx context.Context, file *domain.FileInfo, expiration time.Duration) (string, error)
+	Store(ctx context.Context, file *domain.FileInfo, content io.Reader) error
 }

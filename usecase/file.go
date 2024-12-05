@@ -1,423 +1,301 @@
 package usecase
 
 import (
-	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
-	"image"
-	"image/jpeg"
-	"image/png"
 	"io"
-	"net/http"
 	"slices"
-	"time"
 
 	"github.com/todennus/file-service/domain"
 	"github.com/todennus/file-service/usecase/abstraction"
 	"github.com/todennus/file-service/usecase/dto"
-	"github.com/todennus/shared/enumdef"
 	"github.com/todennus/shared/errordef"
+	"github.com/todennus/shared/middleware"
 	"github.com/todennus/shared/scopedef"
 	"github.com/todennus/shared/xcontext"
 	"github.com/todennus/x/mime"
+	"github.com/todennus/x/token"
+	"github.com/todennus/x/xcrypto"
 	"github.com/todennus/x/xerror"
 	"github.com/todennus/x/xhttp"
 )
 
 type FileUsecase struct {
+	maxInMemory int64
+
+	tokenEngine token.Engine
+
 	fileDomain abstraction.FileDomain
 
-	fileSessionRepo abstraction.FileSessionRepository
-	fileStorageRepo abstraction.FileStorageRepository
-	userRepo        abstraction.UserRepository
+	fileUploadPolicyRepo abstraction.FileUploadPolicyRepository
+	fileInfoRepo         abstraction.FileInfoRepository
+	fileOwnershipRepo    abstraction.FileOwnershipRepository
+	fileStorageRepo      abstraction.FileStorageRepository
 }
 
 func NewFileUsecase(
+	maxInMemory int64,
+	tokenEngine token.Engine,
 	fileDomain abstraction.FileDomain,
-	fileSessionRepo abstraction.FileSessionRepository,
+	fileUploadPolicyRepo abstraction.FileUploadPolicyRepository,
+	fileRepo abstraction.FileInfoRepository,
+	fileOwnerRepo abstraction.FileOwnershipRepository,
 	fileStorageRepo abstraction.FileStorageRepository,
-	userRepo abstraction.UserRepository,
 ) *FileUsecase {
 	return &FileUsecase{
+		maxInMemory: maxInMemory,
+		tokenEngine: tokenEngine,
+
 		fileDomain: fileDomain,
 
-		fileSessionRepo: fileSessionRepo,
-		fileStorageRepo: fileStorageRepo,
-		userRepo:        userRepo,
+		fileUploadPolicyRepo: fileUploadPolicyRepo,
+		fileInfoRepo:         fileRepo,
+		fileOwnershipRepo:    fileOwnerRepo,
+		fileStorageRepo:      fileStorageRepo,
 	}
 }
 
-func (usecase *FileUsecase) ValidatePolicy(
+func (usecase *FileUsecase) RegisterUpload(
 	ctx context.Context,
-	req *dto.ValidatePolicyRequest,
-) (*dto.ValidatePolicyResponse, error) {
-	if req.Size == 0 {
-		return nil, xerror.Enrich(errordef.ErrRequestInvalid, "require a positive size")
+	req *dto.RegisterUploadRequest,
+) (*dto.RegisterUploadResponse, error) {
+	if scopedef.Eval(xcontext.Scope(ctx)).RequireAdmin(scopedef.AdminRegisterFilePolicy).IsUnsatisfied() {
+		return nil, xerror.Enrich(errordef.ErrForbidden, "insufficient scope")
 	}
 
-	source, _, found := enumdef.ParseFilePolicyToken(req.PolicyToken)
-	if !found {
-		return nil, xerror.Enrich(errordef.ErrRequestInvalid, "invalid policy token format")
+	policy := usecase.fileDomain.NewUploadPolicy(req.UserID, req.AllowedTypes, req.MaxSize)
+	if err := usecase.fileUploadPolicyRepo.Save(ctx, policy); err != nil {
+		return nil, errordef.ErrServer.Hide(err, "failed-to-save-upload-policy")
 	}
 
-	// Get the overriden policy from the source.
-	var err error
-	var overridenPolicy *dto.OverridenPolicyInfo
-	var policy *domain.UploadPolicy
-	switch source {
-	case enumdef.PolicySourceUserAvatar:
-		policy = usecase.fileDomain.DefaultAvatarUploadPolicy()
-		overridenPolicy, err = usecase.userRepo.ValidateAvatarPolicyToken(ctx, req.PolicyToken)
-		if err != nil {
-			return nil, usecase.translateValidateExternalPolicyError(err, source)
-		}
+	return dto.NewRegisterUploadResponse(policy.Token), nil
+}
 
-	default:
-		return nil, xerror.Enrich(errordef.ErrRequestInvalid, "invalid policy source")
+func (usecase *FileUsecase) Upload(ctx context.Context, req *dto.UploadRequest) (*dto.UploadResponse, error) {
+	defer req.File.Close()
+
+	if xcontext.RequestSubjectID(ctx) == 0 {
+		return nil, xerror.Enrich(errordef.ErrUnauthenticated, middleware.RequireAuthenticationMessage)
 	}
 
-	// Override the default policy by the source policy, then validate the image
-	// information against the policy.
-	dto.OverridePolicyInfo(overridenPolicy, policy)
-	if err := usecase.validatePolicy(req, policy); err != nil {
+	file, metadata, err := usecase.checkAndParseFile(ctx, req.File, req.UploadToken)
+	if err != nil {
 		return nil, err
 	}
 
-	// Generate an upload session. The user can use the upload token to upload
-	// a file.
-	session := usecase.fileDomain.NewUploadSession(
-		source, overridenPolicy.PolicySourceMetadata, req.Type, req.Size)
-	if err := usecase.fileSessionRepo.SaveUploadSession(ctx, session); err != nil {
-		return nil, errordef.ErrServer.Hide(err, "failed-to-save-policy-session")
+	fileHash, err := xcrypto.Sha256(file)
+	if err != nil {
+		return nil, errordef.ErrServer.Hide(err, "failed-to-hash-file")
 	}
 
-	return dto.NewValidatePolicyResponse(session.Token), nil
-}
+	fileInfo := usecase.fileDomain.NewFileInfo(base64.RawURLEncoding.EncodeToString(fileHash), metadata)
 
-func (usecase *FileUsecase) Upload(
-	ctx context.Context,
-	req *dto.UploadRequest,
-) (*dto.UploadResponse, error) {
-	defer req.Content.Close()
-
-	// Load the policy uploadSession
-	uploadSession, err := usecase.fileSessionRepo.LoadUploadSession(ctx, req.UploadToken)
-	if err != nil {
-		if errors.Is(err, errordef.ErrNotFound) {
-			return nil, xerror.Enrich(errordef.ErrForbidden, "invalid upload token")
+	ctx = xcontext.WithDBTransaction(ctx)
+	if err := usecase.fileInfoRepo.Create(ctx, fileInfo); err == nil {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			ctx = xcontext.DBRollback(ctx)
+			return nil, errordef.ErrServer.Hide(err, "failed-to-seek-file")
 		}
 
-		return nil, errordef.ErrServer.Hide(err, "failed-to-load-upload-session")
+		if err := usecase.fileStorageRepo.Store(ctx, fileInfo, file); err != nil {
+			ctx = xcontext.DBRollback(ctx)
+			return nil, errordef.ErrServer.Hide(err, "failed-to-store-file")
+		}
+	} else if !errors.Is(err, errordef.ErrDuplicated) {
+		ctx = xcontext.DBRollback(ctx)
+		return nil, errordef.ErrServer.Hide(err, "failed-to-create-file-info")
 	}
 
-	if err := usecase.fileSessionRepo.DeleteUploadSession(ctx, req.UploadToken); err != nil {
-		xcontext.Logger(ctx).Warn("failed-to-delete-upload-session", "err", err)
+	// The transaction of storing the file must be committed before storing the
+	// file's ownership.
+	//
+	// Why? It prevents the situation where the file is uploaded again, wasting
+	// the server's resources.
+	//
+	// Don't worry if no one uses this file; it will be deleted periodically
+	// by the janitor.
+	ctx = xcontext.DBCommit(ctx)
+
+	ownership := usecase.fileDomain.NewFileOwnership(fileInfo.ID, xcontext.RequestSubjectID(ctx))
+	if err := usecase.fileOwnershipRepo.Create(ctx, ownership); err != nil && !errors.Is(err, errordef.ErrDuplicated) {
+		return nil, errordef.ErrServer.Hide(err, "failed-to-create-file-owner-info")
 	}
 
-	if uploadSession.ExpiresAt.Before(time.Now()) {
-		return nil, xerror.Enrich(errordef.ErrForbidden, "expired upload token")
+	fileToken := usecase.fileDomain.NewFileToken(fileInfo, ownership)
+	fileTokenString, err := usecase.tokenEngine.Generate(ctx, dto.FileTokenFromDomain(fileToken))
+	if err != nil {
+		return nil, errordef.ErrServer.Hide(err, "failed-to-generate-file-token")
 	}
 
-	// If the file size can be determined from the request, it should be checked
-	// here. Otherwise, it will need to be checked after uploading the file to
-	// storage.
-	if req.Size != -1 && req.Size != uploadSession.FileMetadata.Size {
-		return nil, xerror.Enrich(errordef.ErrFileMismatchedSize,
-			"mismachted uploaded file size (got %d, expected %d)", req.Size, uploadSession.FileMetadata.Size)
+	return dto.NewUploadResponse(fileInfo.ID, fileInfo.Metadata.Bucket, ownership.ID, fileTokenString), nil
+}
+
+func (usecase *FileUsecase) RetrieveFileToken(
+	ctx context.Context,
+	req *dto.RetrieveFileTokenRequest,
+) (*dto.RetrieveFileTokenResponse, error) {
+	ownership, err := usecase.fileOwnershipRepo.GetByID(ctx, req.OwnershipID)
+	if err != nil {
+		if errors.Is(err, errordef.ErrNotFound) {
+			return nil, xerror.Enrich(errordef.ErrForbidden, "not found file ownership")
+		}
+
+		return nil, errordef.ErrServer.Hide(err, "failed-to-get-file-ownership")
 	}
 
-	nSniff := 512
-	if mime.IsImage[uploadSession.FileMetadata.Type] {
+	if ownership.UserID != xcontext.RequestSubjectID(ctx) {
+		return nil, xerror.Enrich(errordef.ErrForbidden, "the file is not owned by this user")
+	}
+
+	file, err := usecase.fileInfoRepo.GetByID(ctx, ownership.FileID)
+	if err != nil {
+		return nil, errordef.ErrServer.Hide(err, "failed-to-get-file-info")
+	}
+
+	fileToken := usecase.fileDomain.NewFileToken(file, ownership)
+	fileTokenString, err := usecase.tokenEngine.Generate(ctx, dto.FileTokenFromDomain(fileToken))
+	if err != nil {
+		return nil, errordef.ErrServer.Hide(err, "failed-to-generate-file-token")
+	}
+
+	return dto.NewRetrieveFileTokenResponse(fileTokenString), nil
+}
+
+func (usecase *FileUsecase) CreatePresignedURL(
+	ctx context.Context,
+	req *dto.CreatePresignedURLRequest,
+) (*dto.CreatePresignedURLResponse, error) {
+	if scopedef.Eval(xcontext.Scope(ctx)).RequireAdmin(scopedef.AdminCreatePresignedFile).IsUnsatisfied() {
+		return nil, xerror.Enrich(errordef.ErrForbidden, "insufficient scope")
+	}
+
+	if req.FileID != "" && req.OwnershipID != 0 {
+		return nil, xerror.Enrich(errordef.ErrRequestInvalid, "not allow providing both file_id and ownership_id")
+	}
+
+	if req.Expiration == 0 {
+		return nil, xerror.Enrich(errordef.ErrRequestInvalid, "require expiration")
+	}
+
+	fileID := req.FileID
+	if fileID == "" {
+		ownership, err := usecase.fileOwnershipRepo.GetByID(ctx, req.OwnershipID)
+		if err != nil {
+			return nil, errordef.ErrServer.Hide(err, "failed-to-get-file-ownership", "id", req.OwnershipID)
+		}
+
+		fileID = ownership.FileID
+	}
+
+	info, err := usecase.fileInfoRepo.GetByID(ctx, fileID)
+	if err != nil {
+		if errors.Is(err, errordef.ErrNotFound) {
+			return nil, xerror.Enrich(errordef.ErrNotFound, "not found file %s", fileID)
+		}
+
+		return nil, errordef.ErrServer.Hide(err, "failed-to-get-file", "id", fileID)
+	}
+
+	presignedURL, err := usecase.fileStorageRepo.Presign(ctx, info, req.Expiration)
+	if err != nil {
+		return nil, errordef.ErrServer.Hide(err, "failed-to-generate-presigned-url")
+	}
+
+	return dto.NewCreatePresignedURLResponse(presignedURL), nil
+}
+
+func (usecase *FileUsecase) ChangeRefCount(
+	ctx context.Context,
+	req *dto.ChangeRefcountRequest,
+) (*dto.ChangeRefcountResponse, error) {
+	if scopedef.Eval(xcontext.Scope(ctx)).RequireAdmin(scopedef.AdminChangeRefcountFileOwnership).IsUnsatisfied() {
+		return nil, xerror.Enrich(errordef.ErrForbidden, "insufficient scope")
+	}
+
+	ctx = xcontext.WithDBTransaction(ctx)
+	defer xcontext.DBCommit(ctx)
+
+	for i := range req.IncOwnershipID {
+		if err := usecase.fileOwnershipRepo.ChangeRefCount(ctx, req.IncOwnershipID[i], 1); err != nil {
+			ctx = xcontext.DBRollback(ctx)
+			return nil, errordef.ErrServer.Hide(err, "failed-to-increase-ref-count", "oid", req.IncOwnershipID[i])
+		}
+	}
+
+	for i := range req.DecOwnershipID {
+		if err := usecase.fileOwnershipRepo.ChangeRefCount(ctx, req.DecOwnershipID[i], -1); err != nil {
+			ctx = xcontext.DBRollback(ctx)
+			return nil, errordef.ErrServer.Hide(err, "failed-to-decrease-ref-count", "oid", req.DecOwnershipID[i])
+		}
+	}
+
+	return dto.NewChangeRefcountResponse(), nil
+}
+
+func (usecase *FileUsecase) checkAndParseFile(
+	ctx context.Context,
+	file *xhttp.File,
+	uploadToken string,
+) (io.ReadSeeker, *domain.FileMetadata, error) {
+	policy, err := usecase.fileUploadPolicyRepo.LoadAndDelete(ctx, uploadToken)
+	if err != nil {
+		if errors.Is(err, errordef.ErrNotFound) {
+			return nil, nil, xerror.Enrich(errordef.ErrRequestInvalid, "invalid token")
+		}
+
+		return nil, nil, err
+	}
+
+	if xcontext.RequestSubjectID(ctx) != policy.UserID {
+		return nil, nil, xerror.Enrich(errordef.ErrForbidden, "not allow the user to use this token")
+	}
+
+	contentType, err := usecase.checkContentType(file, policy.AllowedTypes)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var fileContent io.ReadSeeker
+	file.SetMaxSize(policy.MaxSize)
+	if policy.MaxSize > usecase.maxInMemory {
+		fileContent, err = file.AsFile()
+	} else {
+		fileContent, err = file.AsBytes()
+	}
+
+	if err != nil {
+		if mberr := xhttp.AsMaxBytesError(err); mberr != nil {
+			return nil, nil, xerror.Enrich(errordef.ErrRequestTooLarge, "file too large (limit %d)", policy.MaxSize)
+		}
+
+		return nil, nil, errordef.ErrServer.Hide(err, "failed-to-parse-file")
+	}
+
+	return fileContent, &domain.FileMetadata{
+		Bucket: usecase.fileDomain.ClassifyBucket(contentType),
+		Type:   contentType,
+		Size:   file.ContentLength(),
+	}, nil
+}
+
+func (usecase *FileUsecase) checkContentType(file *xhttp.File, allowedTypes []string) (string, error) {
+	nSniff := int64(512)
+	if mime.IsImage(allowedTypes...) {
 		// Although http.DetectContentType considers at most 512 bytes to detect
 		// the file type, detecting image types needs only first 12 bytes.
 		nSniff = 12
 	}
 
-	detectedType := xhttp.DetectContentType(req.Content, nSniff)
-	if detectedType != uploadSession.FileMetadata.Type {
-		return nil, xerror.Enrich(errordef.ErrFileMismatchedType,
-			"mismachted uploaded file type (got %s, expected %s)", detectedType, uploadSession.FileMetadata.Type)
-	}
-
-	temporaryFileSession := usecase.fileDomain.NewTemporaryFileSession(uploadSession)
-
-	metadata, err := usecase.fileStorageRepo.StoreTemporary(
-		ctx,
-		temporaryFileSession.Token,
-		http.MaxBytesReader(nil, req.Content, int64(uploadSession.FileMetadata.Size)),
-		int64(req.Size),
-		detectedType,
-	)
+	detectedType, err := file.ContentType(nSniff)
 	if err != nil {
-		return nil, errordef.ErrServer.Hide(err, "failed-to-store-temporary-file")
+		return detectedType, errordef.ErrServer.Hide(err, "failed-to-detect-content-type")
 	}
 
-	shouldRemoveFile := false
-	defer func() {
-		if shouldRemoveFile {
-			if err := usecase.fileStorageRepo.RemoveTemporary(ctx, temporaryFileSession.Token); err != nil {
-				xcontext.Logger(ctx).Warn("failed-to-remove-invalid-temporary-file", "err", err)
-			}
-		}
-	}()
-
-	// If the file size cannot be determined from the request, it will be
-	// checked after uploading the file to storage.
-	if req.Size == -1 && metadata.Size != uploadSession.FileMetadata.Size {
-		shouldRemoveFile = true
-		return nil, xerror.Enrich(errordef.ErrRequestInvalid,
-			"mismachted uploaded file size (got %d, expected %d)", metadata.Size, uploadSession.FileMetadata.Size)
+	if !slices.Contains(allowedTypes, detectedType) {
+		return detectedType, xerror.Enrich(errordef.ErrFileMismatchedType,
+			"mismachted uploaded file type (got %s, expected %s)", detectedType, allowedTypes)
 	}
 
-	temporaryFileSession.FileHash = metadata.Hash
-	if err := usecase.fileSessionRepo.SaveTemporarySession(ctx, temporaryFileSession); err != nil {
-		shouldRemoveFile = true
-		return nil, errordef.ErrServer.Hide(err, "failed-to-save-temporary-file-session")
-	}
-
-	return dto.NewUploadResponse(temporaryFileSession.Token), nil
-}
-
-func (usecase *FileUsecase) ValidateTemporaryFile(
-	ctx context.Context,
-	req *dto.ValidateTemporaryFileRequest,
-) (*dto.ValidateTemporaryFileResponse, error) {
-	if scopedef.Eval(xcontext.Scope(ctx)).RequireAdmin(scopedef.AdminCommandTemporaryFile).IsUnsatisfied() {
-		return nil, xerror.Enrich(errordef.ErrForbidden, "insufficient scope")
-	}
-
-	temporaryFileSession, err := usecase.fileSessionRepo.LoadTemporarySession(ctx, req.TemporaryFileToken)
-	if err != nil {
-		if errors.Is(err, errordef.ErrNotFound) {
-			return nil, xerror.Enrich(errordef.ErrRequestInvalid, "invalid token")
-		}
-
-		return nil, errordef.ErrServer.Hide(err, "failed-to-load-temporary-file-session")
-	}
-
-	if temporaryFileSession.ExpiresAt.Before(time.Now()) {
-		return nil, xerror.Enrich(errordef.ErrRequestInvalid, "expired token")
-	}
-
-	return dto.NewValidateTemporaryFileResponse(
-		temporaryFileSession.UploadSessionInfo.PolicyMetadata,
-		temporaryFileSession.UploadSessionInfo.FileMetadata.Type,
-		temporaryFileSession.UploadSessionInfo.FileMetadata.Size,
-	), nil
-}
-
-func (usecase *FileUsecase) CommandTemporaryFile(
-	ctx context.Context,
-	req *dto.CommandTemporaryFileRequest,
-) (*dto.CommandTemporaryFileResponse, error) {
-	if scopedef.Eval(xcontext.Scope(ctx)).RequireAdmin(scopedef.AdminCommandTemporaryFile).IsUnsatisfied() {
-		return nil, xerror.Enrich(errordef.ErrForbidden, "insufficient scope")
-	}
-
-	session, err := usecase.fileSessionRepo.LoadTemporarySession(ctx, req.TemporaryFileToken)
-	if err != nil {
-		if errors.Is(err, errordef.ErrNotFound) {
-			return nil, xerror.Enrich(errordef.ErrRequestInvalid, "invalid token")
-		}
-
-		return nil, errordef.ErrServer.Hide(err, "failed-to-load-temporary-file-session")
-	}
-
-	if err := usecase.fileSessionRepo.DeleteTemporarySession(ctx, req.TemporaryFileToken); err != nil {
-		xcontext.Logger(ctx).Warn("failed-to-delete-temporary-file-session", "err", err)
-	}
-
-	if session.ExpiresAt.Before(time.Now()) {
-		return nil, xerror.Enrich(errordef.ErrRequestInvalid, "expired token")
-	}
-
-	if session.UploadSessionInfo.PolicySource != req.PolicySource {
-		return nil, xerror.Enrich(errordef.ErrRequestInvalid, "mismatched policy source")
-	}
-
-	shouldRemoveTemporary := false
-	var newContent *dto.FileContentWrapper
-	var resp *dto.CommandTemporaryFileResponse
-	switch req.Command {
-	case enumdef.TemporaryFileCommandDelete:
-		shouldRemoveTemporary = true
-
-	case enumdef.TemporaryFileCommandSaveAsImage:
-		shouldRemoveTemporary, resp, err = usecase.commandSaveAsImage(ctx, session)
-
-	case enumdef.TemporaryFileCommandImageMetadata:
-		shouldRemoveTemporary, resp, err = usecase.commandImageMetadata(ctx, session)
-
-	case enumdef.TemporaryFileCommandChangeImageType:
-		shouldRemoveTemporary, newContent, resp, err = usecase.commandChangeImageType(ctx, req.Metadata, session)
-	default:
-		err = xerror.Enrich(errordef.ErrRequestInvalid, "invalid command %s", req.Command)
-	}
-
-	if shouldRemoveTemporary {
-		if err := usecase.fileStorageRepo.RemoveTemporary(ctx, session.Token); err != nil {
-			xcontext.Logger(ctx).Warn("failed-to-remove-temporary-file", "err", err, "file", session.Token)
-		}
-
-		if err := usecase.fileSessionRepo.DeleteTemporarySession(ctx, session.Token); err != nil {
-			xcontext.Logger(ctx).Warn("failed-to-remove-temporary-file-sesion", "err", err, "token", session.Token)
-		}
-	}
-
-	if err != nil {
-		return nil, err
-	}
-
-	if resp == nil {
-		resp = &dto.CommandTemporaryFileResponse{}
-	}
-
-	if newContent != nil {
-		newSession := usecase.fileDomain.NewTemporaryFileSession(session.UploadSessionInfo)
-		metadata, err := usecase.fileStorageRepo.StoreTemporary(
-			ctx, newSession.Token, newContent.Content, newContent.Size, newContent.Type)
-		if err != nil {
-			return nil, errordef.ErrServer.Hide(err, "failed-to-store-new-temporary-file")
-		}
-
-		newSession.FileHash = metadata.Hash
-		if err := usecase.fileSessionRepo.SaveTemporarySession(ctx, newSession); err != nil {
-			return nil, errordef.ErrServer.Hide(err, "failed-to-save-temporary-file-session")
-		}
-
-		resp.NextTemporaryFileToken = newSession.Token
-	}
-
-	return resp, nil
-}
-
-func (usecase *FileUsecase) commandSaveAsImage(
-	ctx context.Context,
-	session *domain.TemporaryFileSession,
-) (bool, *dto.CommandTemporaryFileResponse, error) {
-	ok, err := usecase.fileStorageRepo.ImageExists(ctx, session.FileHash)
-	if err != nil {
-		return false, nil, errordef.ErrServer.Hide(err, "failed-to-check-the-image-existence")
-	}
-
-	if !ok {
-		if err := usecase.fileStorageRepo.ImageSave(ctx, session.FileHash, session.Token); err != nil {
-			return false, nil, errordef.ErrServer.Hide(err, "failed-to-copy-from-session-image")
-		}
-	}
-
-	return true, dto.NewTemporaryFileCommandSave(usecase.fileStorageRepo.ImageURL(session.FileHash)), nil
-}
-
-func (usecase *FileUsecase) commandImageMetadata(
-	ctx context.Context,
-	session *domain.TemporaryFileSession,
-) (bool, *dto.CommandTemporaryFileResponse, error) {
-	content, metadata, err := usecase.fileStorageRepo.GetTemporary(ctx, session.Token)
-	if err != nil {
-		return false, nil, errordef.ErrServer.Hide(err, "failed-to-get-temporary-file")
-	}
-
-	defer content.Close()
-
-	if !mime.IsImage[metadata.Type] {
-		return false, nil, xerror.Enrich(errordef.ErrRequestInvalid, "the file is not an image")
-	}
-
-	image, _, err := image.Decode(content)
-	if err != nil {
-		return true, nil, xerror.Enrich(errordef.ErrFileInvalidContent, "failed to decode file as an image").
-			Hide(err, "failed-to-decode-the-image")
-	}
-
-	bounds := image.Bounds()
-	result := dto.CommandImageMetadataResult{
-		Type:       metadata.Type,
-		Sha256Hash: metadata.Hash,
-		Size:       metadata.Size,
-		Width:      bounds.Dx(),
-		Height:     bounds.Dy(),
-	}
-
-	resp, err := dto.NewCommandTemporaryFileRead(result)
-	if err != nil {
-		return false, nil, errordef.ErrServer.Hide(err, "failed-to-serialize-image-metadata-result")
-	}
-
-	return false, resp, nil
-}
-
-func (usecase *FileUsecase) commandChangeImageType(
-	ctx context.Context,
-	changeTo string,
-	session *domain.TemporaryFileSession,
-) (bool, *dto.FileContentWrapper, *dto.CommandTemporaryFileResponse, error) {
-	if !mime.IsImage[changeTo] {
-		return false, nil, nil, xerror.Enrich(errordef.ErrRequestInvalid, "invalid change mime type %s", changeTo)
-	}
-
-	content, metadata, err := usecase.fileStorageRepo.GetTemporary(ctx, session.Token)
-	if err != nil {
-		return false, nil, nil, errordef.ErrServer.Hide(err, "failed-to-get-temporary-file")
-	}
-
-	defer content.Close()
-
-	if !mime.IsImage[metadata.Type] {
-		return false, nil, nil, xerror.Enrich(errordef.ErrRequestInvalid, "the file is not an image")
-	}
-
-	if metadata.Type == changeTo {
-		return false, nil, nil, nil
-	}
-
-	image, _, err := image.Decode(content)
-	if err != nil {
-		return true, nil, nil, xerror.Enrich(errordef.ErrFileInvalidContent, "failed to decode file as an image").
-			Hide(err, "failed-to-decode-the-image")
-	}
-
-	buffer := bytes.NewBuffer(nil)
-	switch changeTo {
-	case mime.ImageJPEG:
-		err = jpeg.Encode(buffer, image, nil)
-	case mime.ImagePNG:
-		err = png.Encode(buffer, image)
-	}
-	if err != nil {
-		return false, nil, nil, xerror.Enrich(errordef.ErrFileInvalidContent, "cannot generate the new image").
-			Hide(err, "failed-to-encode-the-new-content", "new", changeTo, "cur", metadata.Type)
-	}
-
-	newContent := &dto.FileContentWrapper{
-		Content: io.NopCloser(buffer),
-		Type:    changeTo,
-		Size:    int64(buffer.Len()),
-	}
-
-	return true, newContent, nil, nil
-}
-
-func (*FileUsecase) translateValidateExternalPolicyError(err error, source string) error {
-	if errors.Is(err, errordef.ErrForbidden) {
-		return xerror.Enrich(errordef.ErrForbidden, "invalid policy token").
-			Hide(err, "failed-to-validate-external-policy", "source", source)
-	}
-
-	return errordef.ErrServer.Hide(err, "failed-to-validate-external-policy-error", "source", source)
-}
-
-func (*FileUsecase) validatePolicy(
-	req *dto.ValidatePolicyRequest,
-	policy *domain.UploadPolicy,
-) error {
-	if !slices.Contains(policy.AllowedTypes, req.Type) {
-		return xerror.Enrich(errordef.ErrFileMismatchedType, "unsupported file type")
-	}
-
-	if req.Size > policy.MaxSize {
-		return xerror.Enrich(errordef.ErrFileMismatchedSize, "exceed the maxmium image size")
-	}
-
-	return nil
+	return detectedType, nil
 }

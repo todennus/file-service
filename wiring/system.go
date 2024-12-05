@@ -38,7 +38,7 @@ func InitializeSystem(paths ...string) (*System, error) {
 		return nil, fmt.Errorf("failed to initialize repositories, err=%w", err)
 	}
 
-	usecases, err := InitializeUsecases(ctx, infras, domains, repositories)
+	usecases, err := InitializeUsecases(ctx, config, infras, domains, repositories)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize usecases, err=%w", err)
 	}
