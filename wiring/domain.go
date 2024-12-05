@@ -17,10 +17,11 @@ func InitializeDomains(ctx context.Context, config *config.Config) (*Domains, er
 	domains := &Domains{}
 
 	domains.FileDomain = domain.NewFileDomain(
-		config.Variable.File.DefaultImageAllowedTypes,
-		config.Variable.File.DefaultMaxSize,
-		time.Duration(config.Variable.File.UploadSessionExpiration)*time.Second,
-		time.Duration(config.Variable.File.TemporaryFileExpiration)*time.Second,
+		config.SnowflakeNode,
+		time.Duration(config.Variable.File.TokenExpiration)*time.Second,
+		time.Duration(config.Variable.File.UploadTokenExpiration)*time.Second,
+		config.Variable.File.StorageImageBucket,
+		config.Variable.File.StorageOtherBucket,
 	)
 
 	return domains, nil

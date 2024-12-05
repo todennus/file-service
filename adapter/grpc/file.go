@@ -22,36 +22,46 @@ func NewFileServer(fileUsecase abstraction.FileUsecase) *FileServer {
 	return &FileServer{fileUsecase: fileUsecase}
 }
 
-func (server *FileServer) ValidateTemporaryFile(
+func (server *FileServer) RegisterUpload(
 	ctx context.Context,
-	req *pbdto.FileValidateTemporaryFileRequest,
-) (*pbdto.FileValidateTemporaryFileResponse, error) {
+	req *pbdto.FileRegisterUploadRequest,
+) (*pbdto.FileRegisterUploadResponse, error) {
 	if err := interceptor.RequireAuthentication(ctx); err != nil {
 		return nil, err
 	}
 
-	resp, err := server.fileUsecase.ValidateTemporaryFile(
-		ctx, conversion.NewUsecaseValidateTemporaryFileRequest(req))
-
-	return response.NewGRPCResponseHandler(ctx, conversion.NewPbFileValidateTemporaryFileResponse(resp), err).
+	resp, err := server.fileUsecase.RegisterUpload(ctx, conversion.NewUsecaseRegisterUploadRequest(req))
+	return response.NewGRPCResponseHandler(ctx, conversion.NewPbFileRegisterUploadResponse(resp), err).
 		Map(codes.PermissionDenied, errordef.ErrForbidden).
 		Map(codes.InvalidArgument, errordef.ErrRequestInvalid).
 		Finalize(ctx)
 }
 
-func (server *FileServer) CommandTemporaryFile(
+func (server *FileServer) CreatePresignedURL(
 	ctx context.Context,
-	req *pbdto.FileCommandTemporaryFileRequest,
-) (*pbdto.FileCommandTemporaryFileResponse, error) {
+	req *pbdto.FileCreatePresignedURLRequest,
+) (*pbdto.FileCreatePresignedURLResponse, error) {
 	if err := interceptor.RequireAuthentication(ctx); err != nil {
 		return nil, err
 	}
 
-	resp, err := server.fileUsecase.CommandTemporaryFile(
-		ctx, conversion.NewUsecaseCommandTemporaryFileRequest(req))
+	resp, err := server.fileUsecase.CreatePresignedURL(ctx, conversion.NewUsecaseCreatePresignedURLRequest(req))
+	return response.NewGRPCResponseHandler(ctx, conversion.NewPbFileCreatePresignedURLResponse(resp), err).
+		Map(codes.InvalidArgument, errordef.ErrRequestInvalid).
+		Map(codes.PermissionDenied, errordef.ErrForbidden).
+		Finalize(ctx)
+}
 
-	return response.NewGRPCResponseHandler(ctx, conversion.NewPbFileCommandTemporaryFileResponse(resp), err).
-		Map(codes.InvalidArgument, errordef.ErrRequestInvalid, errordef.ErrFileInvalidContent).
+func (server *FileServer) ChangeRefcount(
+	ctx context.Context, req *pbdto.FileChangeRefcountRequest,
+) (*pbdto.FileChangeRefcountResponse, error) {
+	if err := interceptor.RequireAuthentication(ctx); err != nil {
+		return nil, err
+	}
+
+	resp, err := server.fileUsecase.ChangeRefCount(ctx, conversion.NewUsecaseChangeRefcountRequest(req))
+	return response.NewGRPCResponseHandler(ctx, conversion.NewPbChangeRefcountResponse(resp), err).
+		Map(codes.InvalidArgument, errordef.ErrRequestInvalid).
 		Map(codes.PermissionDenied, errordef.ErrForbidden).
 		Finalize(ctx)
 }

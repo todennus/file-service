@@ -1,89 +1,79 @@
 package dto
 
 import (
-	"encoding/json"
+	"time"
 
-	"github.com/todennus/shared/enumdef"
 	"github.com/todennus/x/xhttp"
+	"github.com/xybor-x/snowflake"
 )
 
-type ValidatePolicyRequest struct {
-	PolicyToken string
-	Type        string
-	Size        int
+type RegisterUploadRequest struct {
+	UserID       snowflake.ID
+	AllowedTypes []string
+	MaxSize      int64
 }
 
-type ValidatePolicyResponse struct {
+type RegisterUploadResponse struct {
 	UploadToken string
 }
 
-func NewValidatePolicyResponse(updateToken string) *ValidatePolicyResponse {
-	return &ValidatePolicyResponse{UploadToken: updateToken}
+func NewRegisterUploadResponse(uploadToken string) *RegisterUploadResponse {
+	return &RegisterUploadResponse{UploadToken: uploadToken}
 }
 
 type UploadRequest struct {
 	UploadToken string
-	Content     xhttp.SniffReadCloser
-	Size        int
+	File        *xhttp.File
 }
 
 type UploadResponse struct {
-	TemporaryFileToken string
+	FileID      string
+	Bucket      string
+	OwnershipID snowflake.ID
+	FileToken   string
 }
 
-func NewUploadResponse(sessionToken string) *UploadResponse {
-	return &UploadResponse{TemporaryFileToken: sessionToken}
+func NewUploadResponse(fileID, bucket string, ownershipID snowflake.ID, fileToken string) *UploadResponse {
+	return &UploadResponse{FileID: fileID, Bucket: bucket, OwnershipID: ownershipID, FileToken: fileToken}
 }
 
-type ValidateTemporaryFileRequest struct {
-	TemporaryFileToken string
+type RetrieveFileTokenRequest struct {
+	OwnershipID snowflake.ID
 }
 
-type ValidateTemporaryFileResponse struct {
-	PolicyMetadata string
-	Type           string
-	Size           int
+type RetrieveFileTokenResponse struct {
+	FileToken string
 }
 
-func NewValidateTemporaryFileResponse(
-	policyMetadata string,
-	ftype string,
-	fsize int,
-) *ValidateTemporaryFileResponse {
-	return &ValidateTemporaryFileResponse{
-		PolicyMetadata: policyMetadata,
-		Type:           ftype,
-		Size:           fsize,
+func NewRetrieveFileTokenResponse(fileToken string) *RetrieveFileTokenResponse {
+	return &RetrieveFileTokenResponse{
+		FileToken: fileToken,
 	}
 }
 
-type CommandTemporaryFileRequest struct {
-	TemporaryFileToken string
-	Command            enumdef.TemporaryFileCommand
-	Metadata           string
-	PolicySource       string
+type CreatePresignedURLRequest struct {
+	OwnershipID snowflake.ID
+	FileID      string
+	Expiration  time.Duration
 }
 
-type CommandTemporaryFileResponse struct {
-	// Only available if the command is "save_*".
-	PersistentURL string
-
-	// Only available for commands which modify the file content.
-	NextTemporaryFileToken string
-
-	// Result is available for read command. It should be serialized as a string.
-	Result string
+type CreatePresignedURLResponse struct {
+	PresignedURL string
 }
 
-func NewTemporaryFileCommandSave(persistentURL string) *CommandTemporaryFileResponse {
-	return &CommandTemporaryFileResponse{PersistentURL: persistentURL}
-}
-
-func NewCommandTemporaryFileRead(data any) (*CommandTemporaryFileResponse, error) {
-	b, err := json.Marshal(data)
-	if err != nil {
-		return nil, err
+func NewCreatePresignedURLResponse(presignedURL string) *CreatePresignedURLResponse {
+	return &CreatePresignedURLResponse{
+		PresignedURL: presignedURL,
 	}
+}
 
-	return &CommandTemporaryFileResponse{Result: string(b)}, nil
+type ChangeRefcountRequest struct {
+	IncOwnershipID []snowflake.ID
+	DecOwnershipID []snowflake.ID
+}
+
+type ChangeRefcountResponse struct{}
+
+func NewChangeRefcountResponse() *ChangeRefcountResponse {
+	return &ChangeRefcountResponse{}
 }

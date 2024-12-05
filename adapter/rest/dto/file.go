@@ -5,42 +5,14 @@ import (
 	"github.com/todennus/shared/errordef"
 	"github.com/todennus/x/xerror"
 	"github.com/todennus/x/xhttp"
+	"github.com/xybor-x/snowflake"
 )
-
-type ValidatePolicyRequest struct {
-	PolicyToken string `json:"policy_token"`
-	Type        string `json:"type"`
-	Size        int    `json:"size"`
-}
-
-func (req *ValidatePolicyRequest) To() *dto.ValidatePolicyRequest {
-	return &dto.ValidatePolicyRequest{
-		PolicyToken: req.PolicyToken,
-		Type:        req.Type,
-		Size:        req.Size,
-	}
-}
-
-type ValidatePolicyResponse struct {
-	UploadToken string `json:"upload_token"`
-}
-
-func NewValidatePolicyResponse(resp *dto.ValidatePolicyResponse) *ValidatePolicyResponse {
-	if resp == nil {
-		return nil
-	}
-
-	return &ValidatePolicyResponse{
-		UploadToken: resp.UploadToken,
-	}
-}
 
 var _ xhttp.FormDataRequest = (*UploadRequest)(nil)
 
 type UploadRequest struct {
-	UploadToken string                `multipart:"upload_token"`
-	File        xhttp.SniffReadCloser `multipart:"file,filesniff"`
-	Size        int                   `multipart:"file,filesize"`
+	UploadToken string      `multipart:"upload_token"`
+	File        *xhttp.File `multipart:"file,file"`
 }
 
 func (req *UploadRequest) To() (*dto.UploadRequest, error) {
@@ -50,8 +22,7 @@ func (req *UploadRequest) To() (*dto.UploadRequest, error) {
 
 	return &dto.UploadRequest{
 		UploadToken: req.UploadToken,
-		Content:     req.File,
-		Size:        req.Size,
+		File:        req.File,
 	}, nil
 }
 
@@ -60,7 +31,10 @@ func (req *UploadRequest) NumFiles() int {
 }
 
 type UploadResponse struct {
-	TemporaryFileToken string `json:"temporary_file_token"`
+	Bucket      string `json:"bucket"`
+	FileID      string `json:"file_id"`
+	OwnershipID string `json:"ownership_id"`
+	FileToken   string `json:"file_token"`
 }
 
 func NewUploadResponse(resp *dto.UploadResponse) *UploadResponse {
@@ -69,6 +43,31 @@ func NewUploadResponse(resp *dto.UploadResponse) *UploadResponse {
 	}
 
 	return &UploadResponse{
-		TemporaryFileToken: resp.TemporaryFileToken,
+		Bucket:      resp.Bucket,
+		FileID:      resp.FileID,
+		OwnershipID: resp.OwnershipID.String(),
+		FileToken:   resp.FileToken,
+	}
+}
+
+type RetrieveFileTokenRequest struct {
+	OwnershipID int64 `param:"ownership_id"`
+}
+
+func (req *RetrieveFileTokenRequest) To() *dto.RetrieveFileTokenRequest {
+	return &dto.RetrieveFileTokenRequest{OwnershipID: snowflake.ID(req.OwnershipID)}
+}
+
+type RetrieveFileTokenResponse struct {
+	FileToken string `json:"file_token"`
+}
+
+func NewRetrieveFileTokenResponse(resp *dto.RetrieveFileTokenResponse) *RetrieveFileTokenResponse {
+	if resp == nil {
+		return nil
+	}
+
+	return &RetrieveFileTokenResponse{
+		FileToken: resp.FileToken,
 	}
 }
